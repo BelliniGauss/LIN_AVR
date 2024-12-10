@@ -52,7 +52,7 @@ void loop()
   dataPacket[3] = 0xD5;
   dataPacket[4] = 0xB0;
 
-  sendData(dataPacket, 5);
+  sendData(dataPacket, 1);
 
   delay(6);
         
