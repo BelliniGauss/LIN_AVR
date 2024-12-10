@@ -15,6 +15,8 @@ uint8_t id = 0;
 uint8_t header_syncByte = 0x55;
 uint8_t header_id;
 
+int lol = -1;
+
 
 uint8_t dataPacket[LIN_MAX_BYTE + 1];   //  the +1 is to accomodate the checksum and send everything together
 
@@ -24,16 +26,14 @@ uint8_t dataPacket[LIN_MAX_BYTE + 1];   //  the +1 is to accomodate the checksum
 void setup() {
   // initialize digital pin LED_BUILTIN as an output.
   pinMode(PINOUT, OUTPUT);
-  pinMode(6, OUTPUT);  
-  //pinMode(6, OUTPUT); 
 
   Serial.begin(speed);    // USART interface for normal bit transfer part of the messages...
 
-dataPacket[0] = 0x25;
-dataPacket[1] = 0xE2;
-dataPacket[2] = 0x80;
-dataPacket[3] = 0xD5;
-dataPacket[4] = 0xB0;
+  dataPacket[0] = 0x25;
+  dataPacket[1] = 0xE2;
+  dataPacket[2] = 0x80;
+  dataPacket[3] = 0xD5;
+  dataPacket[4] = 0xB0;
 
   delay(10);
 }
@@ -46,19 +46,20 @@ void loop()
   header_id = calcHeader( &id);
 
   /*  Sending break condition - blocking for now*/ 
+  Serial.flush();           //  make sure no tx operation is ongoing when changing baudrate.
   Serial.begin(speed/1.5);
   Serial.write(0x00);
-  Serial.flush();
+  Serial.flush();           //  make sure brake condition is fully sent befor continuing
   Serial.begin(speed);
 
   Serial.write(header_syncByte);
   Serial.write(header_id);
 
   delayMicroseconds(us_delay << 2);   // just for testing with only one device
-  add_checkSum(dataPacket, 5 );  
-  Serial.write(dataPacket, 6);
+  //add_checkSum(dataPacket, 1 );  
+  //Serial.write(dataPacket, 2);
 
-  delay(6);
+  delay(500);
         
   id++;
 }
@@ -70,13 +71,21 @@ static inline void add_checkSum(uint8_t * dataArray, uint8_t byteN){
     checksum += (dataArray[i]);
     checksum <= 0xFF ? : checksum-= 0xFF ;
   }
-  dataArray[byteN] = 0xFF^checksum;
+
+  
+  dataArray[byteN] = 0xFF^checksum;   // = ~checksum
+
 }
 
 uint8_t calcHeader(uint8_t * id){
   bool p0 = bit_value(id, 0) ^ bit_value(id, 1) ^ bit_value(id, 2) ^ bit_value(id, 4);
   bool p1 = !(bit_value(id, 1) ^ bit_value(id, 3) ^ bit_value(id, 4) ^ bit_value(id, 5));  
-
-  return (*id & 0b00111111) | (p0 << 6) | (p1 << 7);
+  
+  lol++;
+  if (lol % 3 == 0){
+    return ((*id & 0b00111111) | (p0 << 6) | (p1 << 7)) + 1;
+  }
+  else
+    return (*id & 0b00111111) | (p0 << 6) | (p1 << 7);
 }
 
