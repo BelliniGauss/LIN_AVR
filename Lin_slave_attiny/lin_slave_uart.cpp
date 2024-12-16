@@ -165,26 +165,16 @@ void SM_respond() {
   tx_data[tx_lenght] = LIN_checksum(tx_data, &tx_lenght, LIN_SM.PID);   //  The last byte is set as checksum byte.
   tx_lenght ++;            //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
 
-  // setting up UART for half duplex transmission, first byte, 
-  if(tx_lenght == 1) {   //  anomaly, but will include not to break transmission if it happens???
-    uint8_t ctrla = USART0.CTRLA;
-    //ctrla &= ~USART_RXCIE_bm;    /* TODO verify */           //  Disabling rx interrupt, we'll check manually the correctness of the data.
-    ctrla |=  USART_TXCIE_bm;               //  Enabling tx interrupt, we'll need it for sending the next byte.
-    USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
-    USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
-    /* MUST clear TXCIF **before** writing new char, 
-    otherwise ill-timed interrupt can cause it to erase the flag after the new charchter has been sent!*/
-    USART0.TXDATAL = tx_data[0];     //  Sending the only byte of the frame.
-  }
-  else {
-    uint8_t ctrla = USART0.CTRLA;
-    //ctrla &= ~USART_RXCIE_bm;       /* TODO verify */         //  Disabling rx interrupt, we'll check manually the correctness of the data.
-    ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
-    USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
-    USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
-    /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
-    bytes on the serial interface, right?  TODO DRE isr */  
-  }
+  // setting up UART for half duplex transmission
+  
+  uint8_t ctrla = USART0.CTRLA;
+  //ctrla &= ~USART_RXCIE_bm;    we can't disable RXCIE, we need to keep listening to check correctness of the data TXed.
+  ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
+  USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
+  USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
+  /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
+  bytes on the serial interface, right?  */  
+
 
   //  The interrupt enabled usart routine should now be active, we can return from this isr. 
   //  Interrup active at this point: Tx, Rx, DRE  :::
@@ -217,36 +207,26 @@ void SM_verify_sent_data(){
   }
 }
 
+
+
+/**
+ * @brief Stop transmission at register level. 
+ * Disables TX and DRE interrupts. 
+ * Clean TXcif Interrupt Flag.  * 
+ */
 void abort_transmission(){
-  /*  TODO:
-  stop transmission at register level. 
-  clean the interrupts setup for TX, DRE*/
-}
 
-
-//rivedere che cazzo fa sta roba esattamente 
-ISR(USART0_TXC_vect){
-  uint8_t _data;
-
-  //Writing a ‘1’ to this bit will clear the flag.
-  uint8_t status = USART0.STATUS;  
-  status |= USART_TXCIF_bm;
-
- /*
-      DI SICURO NON VERIFICO COSI LA CORRETTEZZA DI CIO CHE HO TRASMESSO!
+  uint8_t ctrlA = USART0.CTRLA;
+  uint8_t status = USART0.STATUS;
   
-  for(uint8_t i; i< 10; i++)
-  {
-    if(USART0.STATUS & USART_RXCIF_bm){
-    _data = USART0.RXDATAL;
-    break;
-    }
-  }
+  ctrlA = ctrlA & ~(USART_TXCIE_bm | USART_DREIE_bm);    //  Disabling TX and DRE interrupts.
+  status = status | USART_TXCIF_bm;                      //  Clearing the TXCIF flag. by writing a 1 to it.
 
-  if(_data != tx_data + verify_index)*/
-  /* TODO: transmitted byte doesn't match recieved, fault, needs to stop the transmission! */
-
+  USART0.CTRLA = ctrlA;                                  //  Setting the new value of the control register A
+  USART0.STATUS = status;                                //  Setting the new value of the status register.
 }
+
+
 
 /*  TUTTO DA CONTROLLARE */
 ISR(USART0_DRE_vect) {
@@ -254,7 +234,7 @@ ISR(USART0_DRE_vect) {
   uint8_t txTail  = 0;  //HardwareSerial._tx_buffer_tail;
 
   // There must be more data in the output buffer. Send the next byte
-  uint8_t byte_out = LIN_SM.current_data + tx_index;
+  uint8_t byte_out = LIN_SM.data + tx_index;
 
   // clear the TXCIF flag -- "can be cleared by writing a one to its bit location". This makes sure flush() 
   // won't return until the bytes actually got written. It is critical to do this BEFORE we write the next byte
@@ -306,9 +286,8 @@ ideally this is happenning only when the entire data has been sent.
 infact DRE is called before the TXCIF, so the buffer TXDATAL should get
 refilled befort the TX is finished, preventing TXCIF to be called.
 
-
-This original ISR would just empty the tx data that has been read 
-and that's hanging in the rx part of the peripherial:
+The original ISR would just empty the tx data that has been read 
+and that's hanging in the RX part of the peripherial:
 
 - RXDATAL read will allow us to reset RXCIF in STASTUS
 - Reading STATUS will reset the RXCIF flag (only after RXDATAL read)
@@ -321,6 +300,35 @@ clear TXCIE in CTRLA
 set RXCIE   in CTRLA
 store CTRLA
 */
+
+
+/**
+ * @brief TX isr (TXCIF flag in status register) gets callew when all data has been transmitted out 
+ * of the shift register and the transmit buffer (TXDATA) is empty (in the DRE interrupt we couldn't 
+ * add data to TXDATA)
+ * So we have just to disable the TX and DRE interrupts, and clear TXCIF.
+ * (DRE should be already disabled, we'll just clear it to be sure)
+ */
+ISR(USART0_TXC_vect){
+  uint8_t _data;
+
+  //Writing a ‘1’ to this bit will clear the flag.
+  //uint8_t status = USART0.STATUS;  
+  //status |= USART_TXCIF_bm;
+
+  clear TXCIE in CTRLA
+  set RXCIE   in CTRLA
+  store CTRLA
+
+  uint8_t ctrla = USART0.CTRLA;
+  uint8_t status = USART0.STATUS;
+  ctrla &= ~(USART_TXCIE_bm);           //  Disabling TX interrupt
+  ctrla &= ~(USART_DREIE_bm);           //  Disabling DRE interrupt
+  status |= USART_TXCIF_bm;             //  Writing a ‘1’ to this bit will clear the flag.
+
+  USART0.CTRLA = ctrla;                 //  Will disable the TX and DRE interrupt
+  USART0.STATUS = status;               //  will clear the TXCIF flag. 
+}
 
 /*
 ISR(USART0_TXC_vect, ISR_NAKED) {
