@@ -297,7 +297,32 @@ uint8_t LIN_checksum(uint8_t* data, uint8_t* lenght, uint8_t PID_byte) {
   return checksum_8;
 }
 
+/*
+TXCIF gets called when:
+- TX is done
+- no more bytes are present in the buffer to fill the shift register.
 
+ideally this is happenning only when the entire data has been sent.
+infact DRE is called before the TXCIF, so the buffer TXDATAL should get
+refilled befort the TX is finished, preventing TXCIF to be called.
+
+
+This original ISR would just empty the tx data that has been read 
+and that's hanging in the rx part of the peripherial:
+
+- RXDATAL read will allow us to reset RXCIF in STASTUS
+- Reading STATUS will reset the RXCIF flag (only after RXDATAL read)
+
+since all tx operations are completed:
+- it then clears TXCIE (tx interrupt enable)
+- and sets RXCIE (rx interrupt enable):
+
+clear TXCIE in CTRLA
+set RXCIE   in CTRLA
+store CTRLA
+*/
+
+/*
 ISR(USART0_TXC_vect, ISR_NAKED) {
         __asm__ __volatile__(
               "push      r30"     "\n\t"
@@ -314,44 +339,44 @@ ISR(USART0_TXC_vect, ISR_NAKED) {
 }
 
 void __attribute__((naked)) __attribute__((used)) __attribute__((noreturn)) _do_txc_lin(void) {
-        __asm__ __volatile__(
-          "_do_txc_lin:"                      "\n\t" // We start out 11-13 clocks after the interrupt
-            "push       r24"              "\n\t" // r30 and r31 pushed before this.
-            "in         r24,      0x3f"   "\n\t"  // Save SREG
-            "push       r24"              "\n\t"  //
-            "push       r25"              "\n\t"  //
-            "push       r28"              "\n\t"  //
-            "push       r29"              "\n\t"  //
-            "ldd        r28,   Z +  8"    "\n\t"  // Load USART into Y pointer, low byte
-            "ldi        r29,     0x08"    "\n\t"  // all USARTs are 0x08n0 where n is an even hex digit.
-            "ldd        r25,   Y +  5"    "\n\t"  // Y + 5 = USARTn.CTRLA read CTRLA
-          "_txc_flush_rx_lin:"                "\n\t"  // start of rx flush loop.
-            "ld         r24,        Y"    "\n\t"  // Y + 0 = USARTn.RXDATAL rx data
-            "ldd        r24,   Y +  4"    "\n\t"  // Y + 4 = USARTn.STATUS
-            "sbrc       r24,        7"    "\n\t"  // if RXC bit is clear...
-            "rjmp       _txc_flush_rx_lin"    "\n\t"  // .... skip this jump to remove more from the buffer.
-            "andi       r25,     0xBF"    "\n\t"  // clear TXCIE
-            "ori        r25,     0x80"    "\n\t"  // set RXCIE
-            "std     Y +  5,      r25"    "\n\t"  // store CTRLA
+  __asm__ __volatile__(
+    "_do_txc_lin:"                      "\n\t" // We start out 11-13 clocks after the interrupt
+      "push       r24"              "\n\t" // r30 and r31 pushed before this.
+      "in         r24,      0x3f"   "\n\t"  // Save SREG
+      "push       r24"              "\n\t"  //
+      "push       r25"              "\n\t"  //
+      "push       r28"              "\n\t"  //
+      "push       r29"              "\n\t"  //
+      "ldd        r28,   Z +  8"    "\n\t"  // Load USART into Y pointer, low byte
+      "ldi        r29,     0x08"    "\n\t"  // all USARTs are 0x08n0 where n is an even hex digit.
+      "ldd        r25,   Y +  5"    "\n\t"  // Y + 5 = USARTn.CTRLA read CTRLA
+    "_txc_flush_rx_lin:"                "\n\t"  // start of rx flush loop.
+      "ld         r24,        Y"    "\n\t"  // Y + 0 = USARTn.RXDATAL rx data
+      "ldd        r24,   Y +  4"    "\n\t"  // Y + 4 = USARTn.STATUS
+      "sbrc       r24,        7"    "\n\t"  // if RXC bit is clear...
+      "rjmp       _txc_flush_rx_lin"    "\n\t"  // .... skip this jump to remove more from the buffer.
+      "andi       r25,     0xBF"    "\n\t"  // clear TXCIE
+      "ori        r25,     0x80"    "\n\t"  // set RXCIE
+      "std     Y +  5,      r25"    "\n\t"  // store CTRLA
 //          "ldd        r24,   Z + 12"    "\n\t"
 //          "ahha,   always,     true"    "\n\t"  // wait, if we're in TXC, We are in half duplex mode, duuuuh
 //          "sbrs       r24,        2"    "\n\t"  // if we're in half duplex skip...
 //          "rjmp      .+ 6"              "\n\t"  // a jump over the next three instructoins. Do do them iff in half duplex only
 //          "ori        r24,     0x10"    "\n\t"  // add the "there's an echo in here" bit
 //          "std     Z + 12,      r24"    "\n\t"  // Store modified state
-            "pop        r29"              "\n\t"
-            "pop        r28"              "\n\t"
-            "pop        r25"              "\n\t"
-            "pop        r24"              "\n\t"  // pop r24 to get old SREG back
-            "out       0x3F,      r24"    "\n\t"  // restore sreg.
-            "pop        r24"              "\n\t"  // pop r24 restore it
-            "pop        r31"              "\n\t"  // and r31
-            "pop        r30"              "\n\t"  // Pop the register the ISR did
-            "reti"                        "\n"    // return from the interrupt.
-            ::
-          );
-        __builtin_unreachable();
-      }
+      "pop        r29"              "\n\t"
+      "pop        r28"              "\n\t"
+      "pop        r25"              "\n\t"
+      "pop        r24"              "\n\t"  // pop r24 to get old SREG back
+      "out       0x3F,      r24"    "\n\t"  // restore sreg.
+      "pop        r24"              "\n\t"  // pop r24 restore it
+      "pop        r31"              "\n\t"  // and r31
+      "pop        r30"              "\n\t"  // Pop the register the ISR did
+      "reti"                        "\n"    // return from the interrupt.
+      ::
+    );
+  __builtin_unreachable();
+}*/
 
       
 void LIN_slave::begin_LIN_Slave(unsigned long baud ) {
