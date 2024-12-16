@@ -56,7 +56,10 @@ volatile uint8_t current_data_lenght;
 volatile LIN__state_machine_st LIN_SM;
 
 
-
+/**
+ * @brief ISR for the USART0 RXC interrupt.
+ * Will call the state machine to handle the received data.
+ */
 ISR(USART0_RXC_vect) {
   // Needs to update the LIN_slave state machine...
 
@@ -65,7 +68,7 @@ ISR(USART0_RXC_vect) {
   uint8_t   data  = USART0.RXDATAL; 
 
   if(rxDataH & (USART_PERR_bm | 0x01)) {
-    // Parity error in a PID byte, discard the byte.
+    // Parity error (in a PID byte), discard the byte.
     return;
   }
   
@@ -74,13 +77,13 @@ ISR(USART0_RXC_vect) {
     return;
   }
   
-  //possibly valid bte valid onl for ID byte... still need to check.   
+  //POSSIBLY valid byte, (parity check only valid for PID)... still need to check.   
   bool PID_byte_flag = (rxDataH & 0x01);  // Checking if it's an ID byte
 
   if(PID_byte_flag)      //  if it's an ID byte    I have to start over the reception
   {
     LIN_SM.state = SM_PID;    //  Sp I set again the current fn to the PID one.
-  /*  TODO: will need to make sure to stop transmission? no, during transmission rx isr is disabled. */
+  /*  TODO: will need to make sure to stop transmission! */
   }
 
   LIN_SM.new_byte = data;
@@ -184,6 +187,10 @@ void SM_respond() {
   }
 
   //  The interrupt enabled usart routine should now be active, we can return from this isr. 
+  //  Interrup active at this point: Tx, Rx, DRE  :::
+  //  DRE -> will load next tx byte in the shift register,
+  //  TX -> will clear the TXCIF flag. TODO check this. TODO
+  //  RX -> will check the correctness of the data, and will abort transmission if error detected in loopback. 
 }
 
 /**
@@ -194,6 +201,26 @@ void SM_respond() {
  */
 void SM_verify_sent_data(){
 
+  // Check the latest byte with the expected byte we should have transmitted.
+  if ( LIN_SM.new_byte == tx_data[verified_index]){
+    //  The byte was correct, 
+    //  I'll increment the index so next time I'll check the next byte of the tx buffer
+    verified_index++;                    
+  }else{
+    //  The byte read differs from what I should have transmitted, 
+    //  I'll have to abort the transmission.
+    abort_transmission();
+
+    //  Also I'll set state to ignore since I won't have to verify new data, and I need to 
+    //  wait for the next PID byte to start next frame activities
+    LIN_SM.state = SM_ignore;
+  }
+}
+
+void abort_transmission(){
+  /*  TODO:
+  stop transmission at register level. 
+  clean the interrupts setup for TX, DRE*/
 }
 
 

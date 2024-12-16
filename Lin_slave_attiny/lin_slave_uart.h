@@ -35,13 +35,18 @@ typedef struct ID_definition{
   uint8_t data_vec_address;
 }ID_definition;
 
+//  for now here, these are isr related functions.
 
 void SM_PID();
 void SM_listen();
 void SM_respond();
 void SM_ignore();
 void SM_verify_sent_data();
+void abort_transmission();
 
+
+
+//  for now here, these are high level management functions and variables. 
 
 class LIN_slave {
   private:
