@@ -214,6 +214,13 @@ void SM_verify_sent_data(){
  * Disables TX and DRE interrupts. 
  * Clean TXcif Interrupt Flag.  * 
  */
+
+
+/**
+ * @brief Stop transmission at register level. 
+ * Disables TX and DRE interrupts. 
+ * Clean TXcif Interrupt Flag.  * 
+ */
 void abort_transmission(){
 
   uint8_t ctrlA = USART0.CTRLA;
