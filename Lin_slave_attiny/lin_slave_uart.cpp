@@ -25,6 +25,9 @@ One-Wire Half Duplex Mode:
 //#define LOOPBACK
 #define USE_LIN_MODE
 
+
+
+
 /**
  * @brief pointer to a state function of the Lin state machine.
  * @param data_in - the data received from the UART peripheral.
@@ -34,21 +37,23 @@ typedef void (*LIN_statemachine_fn)();
 
 
 typedef struct LIN__state_machine_st {
-  LIN_statemachine_fn current_state;
-  uint8_t current_PID = 255;
-  uint8_t current_data[8];
-  uint8_t current_data_index = 0;
+  LIN_statemachine_fn state;
+  uint8_t PID = 255;
+  uint8_t ID = 255;
+  uint8_t data[8];
+  uint8_t data_index = 0;
   uint8_t new_byte = 0;
+  uint8_t data_lenght = 0;
 }LIN__state_machine_st;
 
-volatile tx_data[9];
-volatile tx_lenght;
-volatile tx_index;
-volatile verify_index;
-//volatile tx_checksum;
+volatile uint8_t tx_data[9];          //  8 data byte max + 1 checksum byte. 
+volatile uint8_t tx_lenght;
+volatile uint8_t tx_index;
+volatile uint8_t verified_index;
+volatile uint8_t current_data_lenght;
 
 
-LIN__state_machine_st LIN_SM;
+volatile LIN__state_machine_st LIN_SM;
 
 
 
@@ -70,85 +75,92 @@ ISR(USART0_RXC_vect) {
   }
   
   //possibly valid bte valid onl for ID byte... still need to check.   
-  bool PID_byte = (rxDataH & 0x01);  // Checking if it's an ID byte
+  bool PID_byte_flag = (rxDataH & 0x01);  // Checking if it's an ID byte
 
-  if(PID_byte)      //  if it's an ID byte    I have to start over the reception
+  if(PID_byte_flag)      //  if it's an ID byte    I have to start over the reception
   {
-    LIN_SM.current_state = SM_PID;    //  Sp I set again the current fn to the PID one.
+    LIN_SM.state = SM_PID;    //  Sp I set again the current fn to the PID one.
   /*  TODO: will need to make sure to stop transmission? no, during transmission rx isr is disabled. */
   }
 
   LIN_SM.new_byte = data;
-  LIN_SM.current_state(); 
+  LIN_SM.state(); 
 }
 
 void SM_PID() {
   uint8_t data_in = LIN_SM.new_byte;
-  uint8_t pid = data_in>>2;                     //  I shift the data_in 2 bits to the right to get rid of parity bits.
-  LIN_SM.current_data_index = 0;     //  new frame is starting, so I reset the data index.
-
-  // The parity check is done by the uart peripheral, so I can just discard the parity bits (6,7).
-  LIN_SM.current_PID = pid;   
+  LIN_SM.PID = data_in & 0b00111111;        //  I cancel out the 2 MSb to get rid of parity bits.
+  LIN_SM.current_data_index = 0;            //  new frame is starting, so I reset the data index.
+  LIN_SM.data_lenght = calc_message_lenght(LIN_SM.PID);
+    
   
   //  I'll now have to check between the programmed IDs if I should Listen to, respond to or ignore the frame...
-  switch (PID_map[pid].type)
+  switch (ID_map[LIN_SM.ID].type)
   {
     case RX_type:
-      LIN_SM.current_state = SM_listen;
+      LIN_SM.state = SM_listen;
       break;
     case TX_type:
-      LIN_SM.current_state = SM_respond;
+      LIN_SM.state = SM_respond;
       break;
     default:
-      LIN_SM.current_state = SM_ignore;
+      LIN_SM.state = SM_ignore;
       break;  
   }
 }
+
+
+/**
+ *  @brief State entered if the current transmission does not interest this slave device. 
+ *  Possible causes: ID not relevant to us or error detected. 
+ *  In this state the slave will ignore the incoming data. It does not exit by itself,
+ *  only the next PID byte will make us start back to listen. 
+ */
 void SM_ignore() {
 }
 
+
+/**
+ * @brief State of active recieving data, we're accumulating new bytes.
+ * When we're done we'll verify the checksum. 
+ * If the checksum is correct, we'll store the data in the buffer.
+ * Then we'll transition to ignore state, SM_ignore.
+*/
 void SM_listen() {
-  uint8_T current_data_lenght = PID_map[LIN_SM.current_PID].data_lenght;
-  if(LIN_SM.current_data_index < current_data_lenght) {
-    LIN_SM.current_data[LIN_SM.current_data_index] = LIN_SM.new_byte;
-    LIN_SM.current_data_index++;
+
+  //  Checks if we're still receiving data:
+  if(LIN_SM.data_index < LIN_SM.data_lenght) {
+    LIN_SM.data[LIN_SM.data_index] = LIN_SM.new_byte;           //  Add the new byte to the LIN_SM recieving buffer
+    LIN_SM.data_index++;                                        //  Increment the index of the LIN_SM buffer.
   }
-  else {
-    // I'ts the checksum byte, I should check it.
-    if(LIN_checksum( LIN_SM.current_data , &current_data_lenght) == LIN_SM.new_byte) {
-      //  The checksum is correct, I can now store the data in the buffer.
-      LIN_frame temp_frame;
-      temp_frame.PID = LIN_SM.current_PID;
-      for (uint8_t i = 0; i < current_data_lenght; i++){
-        temp_frame.data[i] = LIN_SM.current_data[i];
-      }
-      temp_frame.lenght = current_data_lenght;
-      write_data(temp_frame);
-    }
-    else {
-      //  The checksum is incorrect, I should discard the frame.
-      //  Also, I'll set the current state to the SM_ignore. Reception will restart at next PID byte. 
-      LIN_SM.current_state = SM_ignore;
-    }
+  else     // if we recieved the checksum byte:
+  {    
+    uint8_t checksum = LIN_checksum(LIN_SM.data , &(LIN_SM.data_lenght), LIN_SM.PID);
+    
+    //  Check if the recieved byte matches the calculated checksum. 
+    if(checksum == LIN_SM.new_byte)                             //  The checksum just recieved is correct, 
+      write_data_toBuffer(LIN_SM.ID, LIN_SM.data);                // I can now store the data in the buffer.
+    else                                                        //  The checksum is INCORRECT, I will ignore the frame.     
+      LIN_SM.state = SM_ignore;                                   //  I'll set the state to the SM_ignore.    
   }
 }
 
 void SM_respond() {
-  LIN_SM.current_state = SM_ignore;     //  from now on we'll have to transmit only and ignore incoming data.? maybe not necessary
+  LIN_SM.state = SM_verify_sent_data;    //  from now on we'll have to transmit and verify transmitted data for anomalies. 
 
   //  I should now send the data in the buffer to the UART peripheral.
-  LIN_frame temp_frame = read_data(LIN_SM.current_PID);       //  Fetch the data from the buffer.
+  LIN_frame temp_frame = get_frame_fromBuffer(LIN_SM.PID);       //  Fetch the data from the buffer.
   
   //  Setup the buffer and data needed for the tramission.
   verified_index = 0;
   tx_index = 0;
-  tx_lenght = temp_frame.lenght;  
+  tx_lenght = calc_message_lenght(temp_frame.ID);  
   
   for(uint8_t i = 0; i < tx_lenght; i++) {
     tx_data + i = temp_frame.data[i];
   }
-  tx_data[tx_lenght] = LIN_checksum(tx_data, &tx_lenght);   //  The last byte is set as checksum byte.
-  tx_lenght ++;       //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
+  tx_data[tx_lenght] = LIN_checksum(tx_data, &tx_lenght, LIN_SM.PID);   //  The last byte is set as checksum byte.
+  tx_lenght ++;            //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
 
   // setting up UART for half duplex transmission, first byte, 
   if(tx_lenght == 1) {   //  anomaly, but will include not to break transmission if it happens. 
@@ -174,6 +186,15 @@ void SM_respond() {
   //  The interrupt enabled usart routine should now be active, we can return from this isr. 
 }
 
+/**
+ * @brief State entered after setting up the transmission of a response frame.
+ * This state will verify the data sent, by comparing it to the data received since we operate in 
+ * half-duplex mode.
+ * If the data sent is incorrect we'll abort the transmission. 
+ */
+void SM_verify_sent_data(){
+
+}
 
 
 //Soluzione di merda. 
@@ -229,16 +250,22 @@ ISR(USART0_DRE_vect) {
  * @brief Checksum calculation function.
  * @param data - POINTER to array of data bytes.
  * @param lenght - POINTER to the lenght of the data array.
+ * @param PID_byte - the Protected ID (all 8 bits) byte. used in LIN 2.0
  */
-uint8_t LIN_checksum(uint8_t* data, uint8_t* lenght) {
-  uint8_t checksum = 0;
+uint8_t LIN_checksum(uint8_t* data, uint8_t* lenght, uint8_t PID_byte) {
+  uint16_t checksum = 0;
+
+  #ifdef LIN_VERSION_2_0        //  If it's LIN 2.0 the entire PID byte is included in the checksum calculation.
+    checksum = PID_byte;
+  #endif
+
   for (uint8_t i = 0; i < *lenght; i++)
   {
     checksum += data[i];
     checksum <= 0xFF ? : checksum-= 0xFF ;
   }
-  checksum = ~checksum;
-  return checksum;
+  uint8_t checksum_8 = ~checksum;                             //  Algorithm ask for the checksum to be inverted.
+  return checksum_8;
 }
 
 
@@ -374,17 +401,17 @@ void LIN_slave::_set_pins_lin(uint8_t mod_nbr, uint8_t mux_set, uint8_t enmask) 
 
 
 
-LIN_slave::LIN_slave(uint8_t number_of_PID_used, uint16_t baud)
+LIN_slave::LIN_slave(uint8_t number_of_ID_used, uint16_t baud)
 {  
-  if(number_of_PID_used > MAX_PID)
-    number_of_PID_used = MAX_PID;
+  if(number_of_ID_used > MAX_ID)
+    number_of_ID_used = MAX_ID;
   else
-    PID_total = number_of_PID_used;
+    ID_total = number_of_ID_used;
 
-  PID_available = PID_total;
-  PID_next_empty = 0;
+  ID_available = ID_total;
+  ID_next_empty = 0;
 
-  Data_buffer = malloc(PID_total * sizeof(LIN_frame));
+  Data_buffer = malloc(ID_total * sizeof(LIN_frame));
   // Should I catch the possible exception here?
 
   //  Setting the baud rate
@@ -394,24 +421,40 @@ LIN_slave::LIN_slave(uint8_t number_of_PID_used, uint16_t baud)
     baud = DEFAULT_BAUD;    //  Default baud rate
 }
 
-LIN_frame LIN_slave::read_data(uint8_t PID)
+/**
+ * @brief Will retrieve the LIN_frame to be tx inside the buffer.
+ */
+LIN_frame LIN_slave::get_frame_fromBuffer(uint8_t ID)
 {
-  //  if PID is in RX_PID, then return the data
+  //  if ID is in RX_ID, then return the data
   //  else return an empty frame
   LIN_frame temp_frame;
 
-  if(PID_map[PID].type == RX_type)
-    return Data_buffer[PID_map[PID].data_vec_address];
+  if(ID_map[ID].type == TX_type)
+    return Data_buffer[ID_map[ID].data_vec_address];
   else
 
   return temp_frame;
 }
 
-uint8_t LIN_slave::write_data(LIN_frame frame_in)
+
+
+/**
+ * @brief Write the 8 byte data_8 array to the buffer at address ID.
+ */
+uint8_t LIN_slave::write_data_toBuffer(uint8_t ID, uint8_t *data_8)
 {
-  //  if PID is in TX_PID, then write the data, return 0 for correct operation.
-  if(PID_map[frame_in.PID].type == TX_type){
-    Data_buffer[PID_map[frame_in.PID].data_vec_address] = frame_in;
+  //  if ID is in TX_ID, then write the data, return 0 for correct operation.
+  if(ID_map[ID].type == RX_type){
+
+    LIN_frame temp_frame;
+    temp_frame.ID = ID;
+
+    for (uint8_t i = 0; i < 8; i++){
+      temp_frame.data[i] = data_8[i];
+    } 
+
+    Data_buffer[ID_map[ID].data_vec_address] = temp_frame;
     return 0;
   }
   else
@@ -419,38 +462,60 @@ uint8_t LIN_slave::write_data(LIN_frame frame_in)
 }
 
 
-uint8_t LIN_slave::add_RX_PID(uint8_t PID, uint8_t lenght)
+uint8_t LIN_slave::add_RX_ID(uint8_t ID)
 {
-  add_to_list_PID(PID, lenght, RX_type);
+  add_to_list_ID(ID, RX_type);
 }
-uint8_t LIN_slave::add_TX_PID(uint8_t PID)
+uint8_t LIN_slave::add_TX_ID(uint8_t ID)
 {
-  add_to_list_PID(PID, lenght, TX_type);  
+  add_to_list_ID(ID, TX_type);  
 }
 
-uint8_t LIN_slave::add_to_list_PID(uint8_t _PID, uint8_t lenght,  PID_type _type){
+uint8_t LIN_slave::add_to_list_ID(uint8_t _ID,  ID_type _type){
 
-  if(_PID >= MAX_PID)
+  if(_ID >= MAX_ID)
     return -1;
 
-  if(lenght > MAX_LENGHT)
-    return -1;
-
-  if(PID_available < 1)  
+  if(ID_available < 1)  
       return -1;
-  
 
-  if(PID_map[_PID].type == none)
+  if(ID_map[_ID].type == none)
   {
-    PID_map[_PID].type = _type;
-    PID_map[_PID].data_lenght = lenght;
-    PID_map[_PID].data_vec_address = PID_next_empty;
-    PID_next_empty++;
-    PID_available--;
+    ID_map[_ID].type = _type;
+    ID_map[_ID].data_vec_address = ID_next_empty;
+    ID_next_empty++;
+    ID_available--;
     return 0;
   }
   else
     return -1;
+}
+
+
+/**
+ * @brief Calculate the lenght of a lin message based on the ID.
+ * note, for LIN 1.3 will always return 8.
+ */
+uint8_t calc_message_lenght(uint8_t ID){
+  #ifdef LIN_VERSION_1_3
+    return 8;
+  #else
+    ID = ID>>4;
+    switch (ID)
+    {
+    case 0x00:
+      return 2;
+    case 0x01:
+      return 2;
+    case 0x02:
+      return 4;
+    case 0x03:
+      return 8;
+    
+    default:
+      return 0;
+    }
+  #endif
 }
 
 
