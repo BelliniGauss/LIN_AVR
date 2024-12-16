@@ -165,26 +165,16 @@ void SM_respond() {
   tx_data[tx_lenght] = LIN_checksum(tx_data, &tx_lenght, LIN_SM.PID);   //  The last byte is set as checksum byte.
   tx_lenght ++;            //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
 
-  // setting up UART for half duplex transmission, first byte, 
-  if(tx_lenght == 1) {   //  anomaly, but will include not to break transmission if it happens???
-    uint8_t ctrla = USART0.CTRLA;
-    //ctrla &= ~USART_RXCIE_bm;    /* TODO verify */           //  Disabling rx interrupt, we'll check manually the correctness of the data.
-    ctrla |=  USART_TXCIE_bm;               //  Enabling tx interrupt, we'll need it for sending the next byte.
-    USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
-    USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
-    /* MUST clear TXCIF **before** writing new char, 
-    otherwise ill-timed interrupt can cause it to erase the flag after the new charchter has been sent!*/
-    USART0.TXDATAL = tx_data[0];     //  Sending the only byte of the frame.
-  }
-  else {
-    uint8_t ctrla = USART0.CTRLA;
-    //ctrla &= ~USART_RXCIE_bm;       /* TODO verify */         //  Disabling rx interrupt, we'll check manually the correctness of the data.
-    ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
-    USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
-    USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
-    /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
-    bytes on the serial interface, right?  TODO DRE isr */  
-  }
+  // setting up UART for half duplex transmission
+  
+  uint8_t ctrla = USART0.CTRLA;
+  //ctrla &= ~USART_RXCIE_bm;    we can't disable RXCIE, we need to keep listening to check correctness of the data TXed.
+  ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
+  USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
+  USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
+  /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
+  bytes on the serial interface, right?  */  
+
 
   //  The interrupt enabled usart routine should now be active, we can return from this isr. 
   //  Interrup active at this point: Tx, Rx, DRE  :::
@@ -217,10 +207,23 @@ void SM_verify_sent_data(){
   }
 }
 
+
+
+/**
+ * @brief Stop transmission at register level. 
+ * Disables TX and DRE interrupts. 
+ * Clean TXcif Interrupt Flag.  * 
+ */
 void abort_transmission(){
-  /*  TODO:
-  stop transmission at register level. 
-  clean the interrupts setup for TX, DRE*/
+
+  uint8_t ctrlA = USART0.CTRLA;
+  uint8_t status = USART0.STATUS;
+  
+  ctrlA = ctrlA & ~(USART_TXCIE_bm | USART_DREIE_bm);    //  Disabling TX and DRE interrupts.
+  status = status | USART_TXCIF_bm;                      //  Clearing the TXCIF flag. by writing a 1 to it.
+
+  USART0.CTRLA = ctrlA;                                  //  Setting the new value of the control register A
+  USART0.STATUS = status;                                //  Setting the new value of the status register.
 }
 
 
@@ -254,7 +257,7 @@ ISR(USART0_DRE_vect) {
   uint8_t txTail  = 0;  //HardwareSerial._tx_buffer_tail;
 
   // There must be more data in the output buffer. Send the next byte
-  uint8_t byte_out = LIN_SM.current_data + tx_index;
+  uint8_t byte_out = LIN_SM.data + tx_index;
 
   // clear the TXCIF flag -- "can be cleared by writing a one to its bit location". This makes sure flush() 
   // won't return until the bytes actually got written. It is critical to do this BEFORE we write the next byte
