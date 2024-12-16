@@ -163,9 +163,9 @@ void SM_respond() {
   tx_lenght ++;            //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
 
   // setting up UART for half duplex transmission, first byte, 
-  if(tx_lenght == 1) {   //  anomaly, but will include not to break transmission if it happens. 
+  if(tx_lenght == 1) {   //  anomaly, but will include not to break transmission if it happens???
     uint8_t ctrla = USART0.CTRLA;
-    ctrla &= ~USART_RXCIE_bm;               //  Disabling rx interrupt, we'll check manually the correctness of the data.
+    //ctrla &= ~USART_RXCIE_bm;    /* TODO verify */           //  Disabling rx interrupt, we'll check manually the correctness of the data.
     ctrla |=  USART_TXCIE_bm;               //  Enabling tx interrupt, we'll need it for sending the next byte.
     USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
     USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
@@ -175,12 +175,12 @@ void SM_respond() {
   }
   else {
     uint8_t ctrla = USART0.CTRLA;
-    ctrla &= ~USART_RXCIE_bm;               //  Disabling rx interrupt, we'll check manually the correctness of the data.
+    //ctrla &= ~USART_RXCIE_bm;       /* TODO verify */         //  Disabling rx interrupt, we'll check manually the correctness of the data.
     ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
     USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
     USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
     /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
-    bytes on the serial interface. */
+    bytes on the serial interface, right?  TODO DRE isr */  
   }
 
   //  The interrupt enabled usart routine should now be active, we can return from this isr. 
@@ -197,7 +197,7 @@ void SM_verify_sent_data(){
 }
 
 
-//Soluzione di merda. 
+//rivedere che cazzo fa sta roba esattamente 
 ISR(USART0_TXC_vect){
   uint8_t _data;
 
@@ -205,6 +205,8 @@ ISR(USART0_TXC_vect){
   uint8_t status = USART0.STATUS;  
   status |= USART_TXCIF_bm;
 
+ /*
+      DI SICURO NON VERIFICO COSI LA CORRETTEZZA DI CIO CHE HO TRASMESSO!
   
   for(uint8_t i; i< 10; i++)
   {
@@ -214,12 +216,12 @@ ISR(USART0_TXC_vect){
     }
   }
 
-  if(_data != tx_data + verify_index)
+  if(_data != tx_data + verify_index)*/
   /* TODO: transmitted byte doesn't match recieved, fault, needs to stop the transmission! */
 
 }
 
-
+/*  TUTTO DA CONTROLLARE */
 ISR(USART0_DRE_vect) {
   //USART_t* usartModule      = USART0; //(USART_t*)HardwareSerial._hwserial_module;  // reduces size a little bit
   uint8_t txTail  = 0;  //HardwareSerial._tx_buffer_tail;
