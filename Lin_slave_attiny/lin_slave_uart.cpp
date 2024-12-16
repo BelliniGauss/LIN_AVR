@@ -209,12 +209,6 @@ void SM_verify_sent_data(){
 
 
 
-/**
- * @brief Stop transmission at register level. 
- * Disables TX and DRE interrupts. 
- * Clean TXcif Interrupt Flag.  * 
- */
-
 
 /**
  * @brief Stop transmission at register level. 
