@@ -46,14 +46,16 @@ typedef struct LIN__state_machine_st {
   uint8_t data_lenght = 0;
 }LIN__state_machine_st;
 
-volatile uint8_t tx_data[9];          //  8 data byte max + 1 checksum byte. 
-volatile uint8_t tx_lenght;
-volatile uint8_t tx_index;
-volatile uint8_t verified_index;
-volatile uint8_t current_data_lenght;
-
+typedef struct LIN_TX_components{
+  uint8_t data[9];               //  8 data byte max + 1 checksum byte. 
+  uint8_t length;
+  uint8_t index;
+  uint8_t verified_index;
+  //uint8_t current_data_lenght;
+}LIN_TX_components;
 
 volatile LIN__state_machine_st LIN_SM;
+volatile LIN_TX_components LIN_TX;
 
 
 /**
@@ -138,7 +140,7 @@ void SM_listen() {
   }
   else     // if we recieved the checksum byte:
   {    
-    uint8_t checksum = LIN_checksum(LIN_SM.data , &(LIN_SM.data_lenght), LIN_SM.PID);
+    uint8_t checksum = LIN_checksum(LIN_SM.data , LIN_SM.data_lenght, LIN_SM.PID);
     
     //  Check if the recieved byte matches the calculated checksum. 
     if(checksum == LIN_SM.new_byte)                             //  The checksum just recieved is correct, 
@@ -155,15 +157,15 @@ void SM_respond() {
   LIN_frame temp_frame = get_frame_fromBuffer(LIN_SM.PID);       //  Fetch the data from the buffer.
   
   //  Setup the buffer and data needed for the tramission.
-  verified_index = 0;
-  tx_index = 0;
-  tx_lenght = calc_message_lenght(temp_frame.ID);  
+  LIN_TX.verified_index = 0;
+  LIN_TX.index = 0;
+  LIN_TX.length = calc_message_lenght(temp_frame.ID);  
   
-  for(uint8_t i = 0; i < tx_lenght; i++) {
-    tx_data + i = temp_frame.data[i];
+  for(uint8_t i = 0; i < LIN_TX.length; i++) {
+    LIN_TX.data[i] = temp_frame.data[i];
   }
-  tx_data[tx_lenght] = LIN_checksum(tx_data, &tx_lenght, LIN_SM.PID);   //  The last byte is set as checksum byte.
-  tx_lenght ++;            //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
+  LIN_TX.data[LIN_TX.length] = LIN_checksum(LIN_TX.data, LIN_TX.length, LIN_SM.PID);   //  The last byte is set as checksum byte.
+  LIN_TX.length ++;            //  The lenght of the frame is now 1 byte longer, because of the checksum byte.
 
   // setting up UART for half duplex transmission
   
@@ -192,10 +194,10 @@ void SM_respond() {
 void SM_verify_sent_data(){
 
   // Check the latest byte with the expected byte we should have transmitted.
-  if ( LIN_SM.new_byte == tx_data[verified_index]){
+  if ( LIN_SM.new_byte == LIN_TX.data[LIN_TX.verified_index]){
     //  The byte was correct, 
     //  I'll increment the index so next time I'll check the next byte of the tx buffer
-    verified_index++;                    
+    LIN_TX.verified_index++;                    
   }else{
     //  The byte read differs from what I should have transmitted, 
     //  I'll have to abort the transmission.
@@ -235,17 +237,17 @@ ISR(USART0_DRE_vect) {
   uint8_t txTail  = 0;  //HardwareSerial._tx_buffer_tail;
 
   // There must be more data in the output buffer. Send the next byte
-  uint8_t byte_out = LIN_SM.data + tx_index;
+  uint8_t byte_out = LIN_SM.data + LIN_TX.index;
 
   // clear the TXCIF flag -- "can be cleared by writing a one to its bit location". This makes sure flush() 
   // won't return until the bytes actually got written. It is critical to do this BEFORE we write the next byte
   USART0->STATUS = USART_TXCIF_bm;
   USART0->TXDATAL = byte_out;             //we write the next byte
 
-  tx_index = tx_index + 1;
+  LIN_TX.index = LIN_TX.index + 1;
   uint8_t ctrla = USART0->CTRLA;
 
-  if (tx_index == tx_lenght) {
+  if (LIN_TX.index == LIN_TX.length) {
     // Buffer empty, so disable "data register empty" interrupt
     ctrla &= ~(USART_DREIE_bm);
     USART0->CTRLA = ctrla;
@@ -262,7 +264,7 @@ ISR(USART0_DRE_vect) {
  * @param lenght - POINTER to the lenght of the data array.
  * @param PID_byte - the Protected ID (all 8 bits) byte. used in LIN 2.0
  */
-uint8_t LIN_checksum(uint8_t* data, uint8_t* lenght, uint8_t PID_byte) {
+uint8_t LIN_checksum(uint8_t* data, uint8_t lenght, uint8_t PID_byte) {
   uint16_t checksum = 0;
 
   #ifdef LIN_VERSION_2_0        //  If it's LIN 2.0 the entire PID byte is included in the checksum calculation.
@@ -331,61 +333,9 @@ ISR(USART0_TXC_vect){
   USART0.STATUS = status;               //  will clear the TXCIF flag. 
 }
 
-/*
-ISR(USART0_TXC_vect, ISR_NAKED) {
-        __asm__ __volatile__(
-              "push      r30"     "\n\t"
-              "push      r31"     "\n\t"
-              :::);
-        __asm__ __volatile__(
-#if PROGMEM_SIZE > 8192
-              "jmp   _do_txc_lin"     "\n\t"
-#else
-              "rjmp   _do_txc_lin"    "\n\t"
-#endif
-              ::"z"(0x0800));//(&Serial0));
-        __builtin_unreachable();
-}
 
-void __attribute__((naked)) __attribute__((used)) __attribute__((noreturn)) _do_txc_lin(void) {
-  __asm__ __volatile__(
-    "_do_txc_lin:"                      "\n\t" // We start out 11-13 clocks after the interrupt
-      "push       r24"              "\n\t" // r30 and r31 pushed before this.
-      "in         r24,      0x3f"   "\n\t"  // Save SREG
-      "push       r24"              "\n\t"  //
-      "push       r25"              "\n\t"  //
-      "push       r28"              "\n\t"  //
-      "push       r29"              "\n\t"  //
-      "ldd        r28,   Z +  8"    "\n\t"  // Load USART into Y pointer, low byte
-      "ldi        r29,     0x08"    "\n\t"  // all USARTs are 0x08n0 where n is an even hex digit.
-      "ldd        r25,   Y +  5"    "\n\t"  // Y + 5 = USARTn.CTRLA read CTRLA
-    "_txc_flush_rx_lin:"                "\n\t"  // start of rx flush loop.
-      "ld         r24,        Y"    "\n\t"  // Y + 0 = USARTn.RXDATAL rx data
-      "ldd        r24,   Y +  4"    "\n\t"  // Y + 4 = USARTn.STATUS
-      "sbrc       r24,        7"    "\n\t"  // if RXC bit is clear...
-      "rjmp       _txc_flush_rx_lin"    "\n\t"  // .... skip this jump to remove more from the buffer.
-      "andi       r25,     0xBF"    "\n\t"  // clear TXCIE
-      "ori        r25,     0x80"    "\n\t"  // set RXCIE
-      "std     Y +  5,      r25"    "\n\t"  // store CTRLA
-//          "ldd        r24,   Z + 12"    "\n\t"
-//          "ahha,   always,     true"    "\n\t"  // wait, if we're in TXC, We are in half duplex mode, duuuuh
-//          "sbrs       r24,        2"    "\n\t"  // if we're in half duplex skip...
-//          "rjmp      .+ 6"              "\n\t"  // a jump over the next three instructoins. Do do them iff in half duplex only
-//          "ori        r24,     0x10"    "\n\t"  // add the "there's an echo in here" bit
-//          "std     Z + 12,      r24"    "\n\t"  // Store modified state
-      "pop        r29"              "\n\t"
-      "pop        r28"              "\n\t"
-      "pop        r25"              "\n\t"
-      "pop        r24"              "\n\t"  // pop r24 to get old SREG back
-      "out       0x3F,      r24"    "\n\t"  // restore sreg.
-      "pop        r24"              "\n\t"  // pop r24 restore it
-      "pop        r31"              "\n\t"  // and r31
-      "pop        r30"              "\n\t"  // Pop the register the ISR did
-      "reti"                        "\n"    // return from the interrupt.
-      ::
-    );
-  __builtin_unreachable();
-}*/
+
+
 
       
 void LIN_slave::begin_LIN_Slave(unsigned long baud ) {

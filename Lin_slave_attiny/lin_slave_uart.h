@@ -56,7 +56,7 @@ class LIN_slave {
 
     void _set_pins_lin(uint8_t mod_nbr, uint8_t mux_set, uint8_t enmask);
     uint8_t add_to_list_ID(uint8_t _ID, ID_type _type);  //  will add a ID to the list
-    uint8_t LIN_checksum(uint8_t* data, uint8_t* lenght, uint8_t PID_byte);  //  will calculate the checksum
+    uint8_t LIN_checksum(uint8_t* data, uint8_t lenght, uint8_t PID_byte);  //  will calculate the checksum
     uint8_t calculate_message_lenght(uint8_t ID);  //  will calculate the lenght of a lin message based on the ID
 
     void _rx_irq();
