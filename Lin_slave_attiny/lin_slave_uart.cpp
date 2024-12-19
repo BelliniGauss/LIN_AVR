@@ -25,7 +25,7 @@ One-Wire Half Duplex Mode:
 //#define LOOPBACK
 #define USE_LIN_MODE
 
-
+#define ID(pid) (pid & 0b00111111)  //  Masking the 2 MSb of the PID byte, to get the 6 bit ID.
 
 
 /**
@@ -39,7 +39,6 @@ typedef void (*LIN_statemachine_fn)();
 typedef struct LIN__state_machine_st {
   LIN_statemachine_fn state;
   uint8_t PID = 255;
-  uint8_t ID = 255;
   uint8_t data[8];
   uint8_t data_index = 0;
   uint8_t new_byte = 0;
@@ -68,39 +67,41 @@ ISR(USART0_RXC_vect) {
   // Recieve data, pass it to the state machine function poiinted by the state pointer:
   uint8_t rxDataH = USART0.RXDATAH;
   uint8_t   data  = USART0.RXDATAL; 
+  bool is_PID =  !(rxDataH &  USART_DATA8_bm );       //  If the DATA8 bit is 0, then it's a PID byte.
 
-  if(rxDataH & (USART_PERR_bm | 0x01)) {
-    // Parity error (in a PID byte), discard the byte.
-    return;
+  
+  if((rxDataH & USART_PERR_bm) & is_PID) {            //  If ther's a parity error and  is PID
+    abort_transmission();                             //  if we were transmitting, stop that.
+    return;                                           //  discard the byte.
   }
   
-  if(rxDataH & USART_FERR_bm) {
-    // Frame error, discard the byte.
-    return;
+  if(rxDataH & USART_FERR_bm) {           // Frame error,
+    abort_transmission();                 //  if we were transmitting, stop that.
+    return;                               //  discard the byte.
   }
   
-  //POSSIBLY valid byte, (parity check only valid for PID)... still need to check.   
-  bool PID_byte_flag = (rxDataH & 0x01);  // Checking if it's an ID byte
-
-  if(PID_byte_flag)      //  if it's an ID byte    I have to start over the reception
-  {
+  if(is_PID){     //   I have to start over a new reception sequence:
     LIN_SM.state = SM_PID;    //  Sp I set again the current fn to the PID one.
-  /*  TODO: will need to make sure to stop transmission! */
   }
 
-  LIN_SM.new_byte = data;
-  LIN_SM.state(); 
+  LIN_SM.new_byte = data;     //  load new byte to state space of state machine
+  LIN_SM.state();             //  call the state function of the state machine.
 }
 
+
+
+/**
+ * @brief State entered when a new PID byte is received.
+ */
 void SM_PID() {
   uint8_t data_in = LIN_SM.new_byte;
-  LIN_SM.PID = data_in & 0b00111111;        //  I cancel out the 2 MSb to get rid of parity bits.
+  LIN_SM.PID = data_in;        
   LIN_SM.current_data_index = 0;            //  new frame is starting, so I reset the data index.
-  LIN_SM.data_lenght = calc_message_lenght(LIN_SM.PID);
+  LIN_SM.data_lenght = calc_message_lenght(ID(LIN_SM.PID));
     
   
   //  I'll now have to check between the programmed IDs if I should Listen to, respond to or ignore the frame...
-  switch (ID_map[LIN_SM.ID].type)
+  switch (ID_map[ID(LIN_SM.PID)].type)
   {
     case RX_type:
       LIN_SM.state = SM_listen;
@@ -144,7 +145,7 @@ void SM_listen() {
     
     //  Check if the recieved byte matches the calculated checksum. 
     if(checksum == LIN_SM.new_byte)                             //  The checksum just recieved is correct, 
-      write_data_toBuffer(LIN_SM.ID, LIN_SM.data);                // I can now store the data in the buffer.
+      write_data_toBuffer(ID(LIN_SM.PID), LIN_SM.data);                // I can now store the data in the buffer.
     else                                                        //  The checksum is INCORRECT, I will ignore the frame.     
       LIN_SM.state = SM_ignore;                                   //  I'll set the state to the SM_ignore.    
   }
@@ -154,7 +155,7 @@ void SM_respond() {
   LIN_SM.state = SM_verify_sent_data;    //  from now on we'll have to transmit and verify transmitted data for anomalies. 
 
   //  I should now send the data in the buffer to the UART peripheral.
-  LIN_frame temp_frame = get_frame_fromBuffer(LIN_SM.PID);       //  Fetch the data from the buffer.
+  LIN_frame temp_frame = get_frame_fromBuffer(ID(LIN_SM.PID));       //  Fetch the data from the buffer.
   
   //  Setup the buffer and data needed for the tramission.
   LIN_TX.verified_index = 0;
@@ -170,15 +171,15 @@ void SM_respond() {
   // setting up UART for half duplex transmission
   
   uint8_t ctrla = USART0.CTRLA;
-  //ctrla &= ~USART_RXCIE_bm;    we can't disable RXCIE, we need to keep listening to check correctness of the data TXed.
-  ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
+  //ctrla &= ~USART_RXCIE_bm; --->  we can't disable RXCIE, we need to keep listening to check correctness of the data TXed.
+  ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling TX and DRE interrupt, we'll need it for sending the next byte.
   USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
   USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
   /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
   bytes on the serial interface, right?  */  
 
 
-  //  The interrupt enabled usart routine should now be active, we can return from this isr. 
+  //  The interrupt enabled usart tx routine should now be active, we can return from this isr. 
   //  Interrup active at this point: Tx, Rx, DRE  :::
   //  DRE -> will load next tx byte in the shift register,
   //  TX -> will clear the TXCIF flag. TODO check this. TODO
@@ -223,20 +224,17 @@ void abort_transmission(){
   uint8_t status = USART0.STATUS;
   
   ctrlA = ctrlA & ~(USART_TXCIE_bm | USART_DREIE_bm);    //  Disabling TX and DRE interrupts.
-  status = status | USART_TXCIF_bm;                      //  Clearing the TXCIF flag. by writing a 1 to it.
+  status = status | USART_TXCIF_bm;                      //  Clearing the TXCIF flag, if set, by writing a 1 to it.
 
-  USART0.CTRLA = ctrlA;                                  //  Setting the new value of the control register A
-  USART0.STATUS = status;                                //  Setting the new value of the status register.
+  USART0.CTRLA = ctrlA;                   //  Setting the new value of the control register A
+  USART0.STATUS = status;                 //  Setting the new value of the status register, after TX interrupt has been disabled.
 }
 
 
 
-/*  TUTTO DA CONTROLLARE */
 ISR(USART0_DRE_vect) {
-  //USART_t* usartModule      = USART0; //(USART_t*)HardwareSerial._hwserial_module;  // reduces size a little bit
-  uint8_t txTail  = 0;  //HardwareSerial._tx_buffer_tail;
 
-  // There must be more data in the output buffer. Send the next byte
+  // There is more data in the output buffer. Send the next byte
   uint8_t byte_out = LIN_SM.data + LIN_TX.index;
 
   // clear the TXCIF flag -- "can be cleared by writing a one to its bit location". This makes sure flush() 
@@ -245,14 +243,46 @@ ISR(USART0_DRE_vect) {
   USART0->TXDATAL = byte_out;             //we write the next byte
 
   LIN_TX.index = LIN_TX.index + 1;
-  uint8_t ctrla = USART0->CTRLA;
 
-  if (LIN_TX.index == LIN_TX.length) {
-    // Buffer empty, so disable "data register empty" interrupt
+  if (LIN_TX.index == LIN_TX.length) {    
+    // Buffer empty, so disable "data register empty" interrupt, I won't need to add byte to TXDATAL anymore.
+    uint8_t ctrla = USART0->CTRLA;
     ctrla &= ~(USART_DREIE_bm);
     USART0->CTRLA = ctrla;
   }  
 }
+
+
+/**
+ * @brief TX isr (TXCIF flag in status register) gets callew when all data has been transmitted out 
+ * of the shift register and the transmit buffer (TXDATA) is empty (in the DRE interrupt we couldn't 
+ * add data to TXDATA)
+ * So we have just to disable the TX and DRE interrupts, and clear TXCIF.
+ * (DRE should be already disabled, we'll just clear it to be sure)
+ */
+ISR(USART0_TXC_vect){
+  if(LIN_TX.index == LIN_TX.length) {
+    //  All data has been really transmitted, we can now disable the TX and DRE interrupts.
+    uint8_t ctrla = USART0.CTRLA;
+    uint8_t status = USART0.STATUS;
+    ctrla &= ~(USART_TXCIE_bm);           //  Disabling TX interrupt - clear TXCIE in CTRLA
+    ctrla &= ~(USART_DREIE_bm);           //  Disabling DRE interrupt - clear DREIE in CTRLA
+    status |= USART_TXCIF_bm;             //  Writing a ‘1’ to this bit will clear the flag.
+
+    USART0.CTRLA = ctrla;                 //  Will disable the TX and DRE interrupt
+    USART0.STATUS = status;               //  will clear the TXCIF flag. 
+  }else{
+    //  If for any reason ther's still data to be transmitted, setup the next byte to be transmitted.
+    uint8_t byte_out = LIN_SM.data + LIN_TX.index;
+    USART0->STATUS = USART_TXCIF_bm;
+    USART0->TXDATAL = byte_out;             //we write the next byte
+  }
+}
+
+
+
+
+
 
 
 
@@ -280,58 +310,8 @@ uint8_t LIN_checksum(uint8_t* data, uint8_t lenght, uint8_t PID_byte) {
   return checksum_8;
 }
 
-/*
-TXCIF gets called when:
-- TX is done
-- no more bytes are present in the buffer to fill the shift register.
-
-ideally this is happenning only when the entire data has been sent.
-infact DRE is called before the TXCIF, so the buffer TXDATAL should get
-refilled befort the TX is finished, preventing TXCIF to be called.
-
-The original ISR would just empty the tx data that has been read 
-and that's hanging in the RX part of the peripherial:
-
-- RXDATAL read will allow us to reset RXCIF in STASTUS
-- Reading STATUS will reset the RXCIF flag (only after RXDATAL read)
-
-since all tx operations are completed:
-- it then clears TXCIE (tx interrupt enable)
-- and sets RXCIE (rx interrupt enable):
-
-clear TXCIE in CTRLA
-set RXCIE   in CTRLA
-store CTRLA
-*/
 
 
-/**
- * @brief TX isr (TXCIF flag in status register) gets callew when all data has been transmitted out 
- * of the shift register and the transmit buffer (TXDATA) is empty (in the DRE interrupt we couldn't 
- * add data to TXDATA)
- * So we have just to disable the TX and DRE interrupts, and clear TXCIF.
- * (DRE should be already disabled, we'll just clear it to be sure)
- */
-ISR(USART0_TXC_vect){
-  uint8_t _data;
-
-  //Writing a ‘1’ to this bit will clear the flag.
-  //uint8_t status = USART0.STATUS;  
-  //status |= USART_TXCIF_bm;
-
-  clear TXCIE in CTRLA
-  set RXCIE   in CTRLA
-  store CTRLA
-
-  uint8_t ctrla = USART0.CTRLA;
-  uint8_t status = USART0.STATUS;
-  ctrla &= ~(USART_TXCIE_bm);           //  Disabling TX interrupt
-  ctrla &= ~(USART_DREIE_bm);           //  Disabling DRE interrupt
-  status |= USART_TXCIF_bm;             //  Writing a ‘1’ to this bit will clear the flag.
-
-  USART0.CTRLA = ctrla;                 //  Will disable the TX and DRE interrupt
-  USART0.STATUS = status;               //  will clear the TXCIF flag. 
-}
 
 
 
@@ -436,6 +416,7 @@ LIN_slave::LIN_slave(uint8_t number_of_ID_used, uint16_t baud)
 
 /**
  * @brief Will retrieve the LIN_frame to be tx inside the buffer.
+ * @param ID - the ID (6 bit) of the frame to be retrieved.
  */
 LIN_frame LIN_slave::get_frame_fromBuffer(uint8_t ID)
 {
