@@ -26,8 +26,8 @@ Value 0x03 LINAUTO LIN Constrained Auto-Baud mode
 */
 
 //#include "HardwareSerial.h" 
-#define USE_LIN_MODE 1
-//#include <UART0.cpp>
+#define USE_LIN_MODE
+#include <UART0.cpp>
 
 #include <SoftwareSerial.h>
 
