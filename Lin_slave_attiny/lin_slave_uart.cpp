@@ -1,4 +1,6 @@
-      
+#define USE_LIN_MODE
+
+#ifdef USE_LIN_MODE
       /*
 One-Wire Half Duplex Mode:
 1. Internally connect the TXD to the USART receiver (the LBME bit in the USARTn.CTRLA register).
@@ -9,53 +11,25 @@ One-Wire Half Duplex Mode:
 6. Enable the transmitter and the receiver (USARTn.CTRLB).
 */
 
-#include "core_devices.h"
-#include <inttypes.h>
-//#include "api/Stream.h"
-#include "pins_arduino.h"
-#include "UART_constants.h"
-//#include "UART_check_pins.h"
-//#include <HardwareSerial.h>
+
 #include "Arduino.h"
-
-
-
 #include "lin_slave_uart.h"
 
-//#define LOOPBACK
-#define USE_LIN_MODE
+
+//using namespace lin_isr;
+
+
+#define ID(pid) (pid & 0b00111111)  //  Masking the 2 MSb of the PID byte, to get the 6 bit ID.
 
 
 
 
-/**
- * @brief pointer to a state function of the Lin state machine.
- * @param data_in - the data received from the UART peripheral.
- * @param is_ID - true if the data is an ID byte, false otherwise.
- */
-typedef void (*LIN_statemachine_fn)();
 
+static unsigned long baud;
+static uint8_t ID_total = 0, ID_available, ID_next_empty;
+static ID_definition ID_map[MAX_ID];                    //  will contain the ID linked to read/write action  
+static LIN_frame *Data_buffer;     //  will contain the data of the assigned frame
 
-typedef struct LIN__state_machine_st {
-  LIN_statemachine_fn state;
-  uint8_t PID = 255;
-  uint8_t ID = 255;
-  uint8_t data[8];
-  uint8_t data_index = 0;
-  uint8_t new_byte = 0;
-  uint8_t data_lenght = 0;
-}LIN__state_machine_st;
-
-typedef struct LIN_TX_components{
-  uint8_t data[9];               //  8 data byte max + 1 checksum byte. 
-  uint8_t length;
-  uint8_t index;
-  uint8_t verified_index;
-  //uint8_t current_data_lenght;
-}LIN_TX_components;
-
-volatile LIN__state_machine_st LIN_SM;
-volatile LIN_TX_components LIN_TX;
 
 
 
@@ -69,39 +43,41 @@ ISR(USART0_RXC_vect) {
   // Recieve data, pass it to the state machine function poiinted by the state pointer:
   uint8_t rxDataH = USART0.RXDATAH;
   uint8_t   data  = USART0.RXDATAL; 
+  bool is_PID =  !(rxDataH &  USART_DATA8_bm );       //  If the DATA8 bit is 0, then it's a PID byte.
 
-  if(rxDataH & (USART_PERR_bm | 0x01)) {
-    // Parity error (in a PID byte), discard the byte.
-    return;
+  
+  if((rxDataH & USART_PERR_bm) & is_PID) {            //  If ther's a parity error and  is PID
+    abort_transmission();                             //  if we were transmitting, stop that.
+    return;                                           //  discard the byte.
   }
   
-  if(rxDataH & USART_FERR_bm) {
-    // Frame error, discard the byte.
-    return;
+  if(rxDataH & USART_FERR_bm) {           // Frame error,
+    abort_transmission();                 //  if we were transmitting, stop that.
+    return;                               //  discard the byte.
   }
   
-  //POSSIBLY valid byte, (parity check only valid for PID)... still need to check.   
-  bool PID_byte_flag = (rxDataH & 0x01);  // Checking if it's an ID byte
-
-  if(PID_byte_flag)      //  if it's an ID byte    I have to start over the reception
-  {
+  if(is_PID){     //   I have to start over a new reception sequence:
     LIN_SM.state = SM_PID;    //  Sp I set again the current fn to the PID one.
-  /*  TODO: will need to make sure to stop transmission! */
   }
 
-  LIN_SM.new_byte = data;
-  LIN_SM.state(); 
+  LIN_SM.new_byte = data;     //  load new byte to state space of state machine
+  LIN_SM.state();             //  call the state function of the state machine.
 }
 
-void SM_PID() {
+
+
+/**
+ * @brief State entered when a new PID byte is received.
+ */
+void lin_isr::SM_PID() {
   uint8_t data_in = LIN_SM.new_byte;
-  LIN_SM.PID = data_in & 0b00111111;        //  I cancel out the 2 MSb to get rid of parity bits.
-  LIN_SM.current_data_index = 0;            //  new frame is starting, so I reset the data index.
-  LIN_SM.data_lenght = calc_message_lenght(LIN_SM.PID);
+  LIN_SM.PID = data_in;        
+  LIN_SM.data_index = 0;            //  new frame is starting, so I reset the data index.
+  LIN_SM.data_lenght = calculate_message_lenght(ID(LIN_SM.PID));
     
   
   //  I'll now have to check between the programmed IDs if I should Listen to, respond to or ignore the frame...
-  switch (ID_map[LIN_SM.ID].type)
+  switch (ID_map[ID(LIN_SM.PID)].type)
   {
     case RX_type:
       LIN_SM.state = SM_listen;
@@ -122,7 +98,7 @@ void SM_PID() {
  *  In this state the slave will ignore the incoming data. It does not exit by itself,
  *  only the next PID byte will make us start back to listen. 
  */
-void SM_ignore() {
+void lin_isr::SM_ignore() {
 }
 
 
@@ -132,7 +108,7 @@ void SM_ignore() {
  * If the checksum is correct, we'll store the data in the buffer.
  * Then we'll transition to ignore state, SM_ignore.
 */
-void SM_listen() {
+void lin_isr::SM_listen() {
 
   //  Checks if we're still receiving data:
   if(LIN_SM.data_index < LIN_SM.data_lenght) {
@@ -145,22 +121,22 @@ void SM_listen() {
     
     //  Check if the recieved byte matches the calculated checksum. 
     if(checksum == LIN_SM.new_byte)                             //  The checksum just recieved is correct, 
-      write_data_toBuffer(LIN_SM.ID, LIN_SM.data);                // I can now store the data in the buffer.
+      write_toBuffer(ID(LIN_SM.PID), LIN_SM.data);                // I can now store the data in the buffer.
     else                                                        //  The checksum is INCORRECT, I will ignore the frame.     
       LIN_SM.state = SM_ignore;                                   //  I'll set the state to the SM_ignore.    
   }
 }
 
-void SM_respond() {
+void lin_isr::SM_respond() {
   LIN_SM.state = SM_verify_sent_data;    //  from now on we'll have to transmit and verify transmitted data for anomalies. 
 
   //  I should now send the data in the buffer to the UART peripheral.
-  LIN_frame temp_frame = get_frame_fromBuffer(LIN_SM.PID);       //  Fetch the data from the buffer.
+  LIN_frame temp_frame = read_fromBuffer(ID(LIN_SM.PID));       //  Fetch the data from the buffer.
   
   //  Setup the buffer and data needed for the tramission.
-  LIN_TX.verified_index = 0;
+  LIN_TX.verify_index = 0;
   LIN_TX.index = 0;
-  LIN_TX.length = calc_message_lenght(temp_frame.ID);  
+  LIN_TX.length = calculate_message_lenght(temp_frame.ID);  
   
   for(uint8_t i = 0; i < LIN_TX.length; i++) {
     LIN_TX.data[i] = temp_frame.data[i];
@@ -171,18 +147,18 @@ void SM_respond() {
   // setting up UART for half duplex transmission
   
   uint8_t ctrla = USART0.CTRLA;
-  //ctrla &= ~USART_RXCIE_bm;    we can't disable RXCIE, we need to keep listening to check correctness of the data TXed.
-  ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling tx and DRE interrupt, we'll need it for sending the next byte.
+  //ctrla &= ~USART_RXCIE_bm; --->  we can't disable RXCIE, we need to keep listening to check correctness of the data TXed.
+  ctrla |=  USART_TXCIE_bm | USART_DREIE_bm;    //  Enabling TX and DRE interrupt, we'll need it for sending the next byte.
   USART0.STATUS = USART_TXCIF_bm;         //  Clearing the TXCIF flag. by writing a 1 to it.
   USART0.CTRLA = ctrla;                   //  Setting the new value of the control register A
   /* by setting ctrla we enable Data Register Empty interrupt, that will immediately call the ISR and start pushing 
   bytes on the serial interface, right?  */  
 
 
-  //  The interrupt enabled usart routine should now be active, we can return from this isr. 
-  //  Interrup active at this point: Tx, Rx, DRE  :::
+  //  The interrupt enabled usart tx routine should now be active, we can return from this isr. 
+  //  Interrup active at this point: Tx, Rx, DRE  :::<
   //  DRE -> will load next tx byte in the shift register,
-  //  TX -> will clear the TXCIF flag. TODO check this. TODO
+  //  TX -> will clear the TXCIF flag. 
   //  RX -> will check the correctness of the data, and will abort transmission if error detected in loopback. 
 }
 
@@ -192,13 +168,13 @@ void SM_respond() {
  * half-duplex mode.
  * If the data sent is incorrect we'll abort the transmission. 
  */
-void SM_verify_sent_data(){
+void lin_isr::SM_verify_sent_data(){
 
   // Check the latest byte with the expected byte we should have transmitted.
-  if ( LIN_SM.new_byte == LIN_TX.data[LIN_TX.verified_index]){
+  if ( LIN_SM.new_byte == LIN_TX.data[LIN_TX.verify_index]){
     //  The byte was correct, 
     //  I'll increment the index so next time I'll check the next byte of the tx buffer
-    LIN_TX.verified_index++;                    
+    LIN_TX.verify_index++;                    
   }else{
     //  The byte read differs from what I should have transmitted, 
     //  I'll have to abort the transmission.
@@ -218,92 +194,39 @@ void SM_verify_sent_data(){
  * Disables TX and DRE interrupts. 
  * Clean TXcif Interrupt Flag.  * 
  */
-void abort_transmission(){
+void lin_isr::abort_transmission(){
 
   uint8_t ctrlA = USART0.CTRLA;
   uint8_t status = USART0.STATUS;
   
   ctrlA = ctrlA & ~(USART_TXCIE_bm | USART_DREIE_bm);    //  Disabling TX and DRE interrupts.
-  status = status | USART_TXCIF_bm;                      //  Clearing the TXCIF flag. by writing a 1 to it.
+  status = status | USART_TXCIF_bm;                      //  Clearing the TXCIF flag, if set, by writing a 1 to it.
 
-  USART0.CTRLA = ctrlA;                                  //  Setting the new value of the control register A
-  USART0.STATUS = status;                                //  Setting the new value of the status register.
+  USART0.CTRLA = ctrlA;                   //  Setting the new value of the control register A
+  USART0.STATUS = status;                 //  Setting the new value of the status register, after TX interrupt has been disabled.
 }
 
 
 
-/*  TUTTO DA CONTROLLARE */
 ISR(USART0_DRE_vect) {
-  //USART_t* usartModule      = USART0; //(USART_t*)HardwareSerial._hwserial_module;  // reduces size a little bit
-  uint8_t txTail  = 0;  //HardwareSerial._tx_buffer_tail;
 
-  // There must be more data in the output buffer. Send the next byte
-  uint8_t byte_out = LIN_SM.data + LIN_TX.index;
+  // There is more data in the output buffer. Send the next byte
+  uint8_t byte_out = LIN_SM.data[LIN_TX.index];
 
   // clear the TXCIF flag -- "can be cleared by writing a one to its bit location". This makes sure flush() 
   // won't return until the bytes actually got written. It is critical to do this BEFORE we write the next byte
-  USART0->STATUS = USART_TXCIF_bm;
-  USART0->TXDATAL = byte_out;             //we write the next byte
+  USART0.STATUS = USART_TXCIF_bm;
+  USART0.TXDATAL = byte_out;             //we write the next byte
 
   LIN_TX.index = LIN_TX.index + 1;
-  uint8_t ctrla = USART0->CTRLA;
 
-  if (LIN_TX.index == LIN_TX.length) {
-    // Buffer empty, so disable "data register empty" interrupt
+  if (LIN_TX.index == LIN_TX.length) {    
+    // Buffer empty, so disable "data register empty" interrupt, I won't need to add byte to TXDATAL anymore.
+    uint8_t ctrla = USART0.CTRLA;
     ctrla &= ~(USART_DREIE_bm);
-    USART0->CTRLA = ctrla;
+    USART0.CTRLA = ctrla;
   }  
 }
-
-
-
-
-
-/**
- * @brief Checksum calculation function.
- * @param data - POINTER to array of data bytes.
- * @param lenght - POINTER to the lenght of the data array.
- * @param PID_byte - the Protected ID (all 8 bits) byte. used in LIN 2.0
- */
-uint8_t LIN_checksum(uint8_t* data, uint8_t lenght, uint8_t PID_byte) {
-  uint16_t checksum = 0;
-
-  #ifdef LIN_VERSION_2_0        //  If it's LIN 2.0 the entire PID byte is included in the checksum calculation.
-    checksum = PID_byte;
-  #endif
-
-  for (uint8_t i = 0; i < *lenght; i++)
-  {
-    checksum += data[i];
-    checksum <= 0xFF ? : checksum-= 0xFF ;
-  }
-  uint8_t checksum_8 = ~checksum;                             //  Algorithm ask for the checksum to be inverted.
-  return checksum_8;
-}
-
-/*
-TXCIF gets called when:
-- TX is done
-- no more bytes are present in the buffer to fill the shift register.
-
-ideally this is happenning only when the entire data has been sent.
-infact DRE is called before the TXCIF, so the buffer TXDATAL should get
-refilled befort the TX is finished, preventing TXCIF to be called.
-
-The original ISR would just empty the tx data that has been read 
-and that's hanging in the RX part of the peripherial:
-
-- RXDATAL read will allow us to reset RXCIF in STASTUS
-- Reading STATUS will reset the RXCIF flag (only after RXDATAL read)
-
-since all tx operations are completed:
-- it then clears TXCIE (tx interrupt enable)
-- and sets RXCIE (rx interrupt enable):
-
-clear TXCIE in CTRLA
-set RXCIE   in CTRLA
-store CTRLA
-*/
 
 
 /**
@@ -314,45 +237,153 @@ store CTRLA
  * (DRE should be already disabled, we'll just clear it to be sure)
  */
 ISR(USART0_TXC_vect){
-  uint8_t _data;
+  if(LIN_TX.index == LIN_TX.length) {
+    //  All data has been really transmitted, we can now disable the TX and DRE interrupts.
+    uint8_t ctrla = USART0.CTRLA;
+    uint8_t status = USART0.STATUS;
+    ctrla &= ~(USART_TXCIE_bm);           //  Disabling TX interrupt - clear TXCIE in CTRLA
+    ctrla &= ~(USART_DREIE_bm);           //  Disabling DRE interrupt - clear DREIE in CTRLA
+    status |= USART_TXCIF_bm;             //  Writing a ‘1’ to this bit will clear the flag.
 
-  //Writing a ‘1’ to this bit will clear the flag.
-  //uint8_t status = USART0.STATUS;  
-  //status |= USART_TXCIF_bm;
+    USART0.CTRLA = ctrla;                 //  Will disable the TX and DRE interrupt
+    USART0.STATUS = status;               //  will clear the TXCIF flag. 
+  }else{
+    //  If for any reason ther's still data to be transmitted, setup the next byte to be transmitted.
+    uint8_t byte_out = LIN_SM.data[LIN_TX.index];
+    USART0.STATUS = USART_TXCIF_bm;
+    USART0.TXDATAL = byte_out;             //we write the next byte
+  }
+}
 
-  clear TXCIE in CTRLA
-  set RXCIE   in CTRLA
-  store CTRLA
 
-  uint8_t ctrla = USART0.CTRLA;
-  uint8_t status = USART0.STATUS;
-  ctrla &= ~(USART_TXCIE_bm);           //  Disabling TX interrupt
-  ctrla &= ~(USART_DREIE_bm);           //  Disabling DRE interrupt
-  status |= USART_TXCIF_bm;             //  Writing a ‘1’ to this bit will clear the flag.
 
-  USART0.CTRLA = ctrla;                 //  Will disable the TX and DRE interrupt
-  USART0.STATUS = status;               //  will clear the TXCIF flag. 
+uint8_t lin_isr::write_toBuffer(uint8_t ID, volatile uint8_t *data_8)
+{
+  //  if ID is in TX_ID, then write the data, return 0 for correct operation.
+  if(ID_map[ID].type == RX_type){
+
+    LIN_frame temp_frame;
+    temp_frame.ID = ID;
+
+    for (uint8_t i = 0; i < 8; i++){
+      temp_frame.data[i] = data_8[i];
+    } 
+
+    Data_buffer[ID_map[ID].data_vec_address] = temp_frame;
+    return 0;
+  }
+  else
+    return -1;
+}
+
+
+
+/**
+ * @brief Will retrieve the LIN_frame to be tx inside the buffer.
+ * @param ID - the ID (6 bit) of the frame to be retrieved.
+ */
+LIN_frame lin_isr::read_fromBuffer(uint8_t ID)
+{
+  //  if ID is in RX_ID, then return the data
+  //  else return an empty frame
+  LIN_frame temp_frame;
+
+  if(ID_map[ID].type == TX_type)
+    return Data_buffer[ID_map[ID].data_vec_address];
+  else
+
+  return temp_frame;
+}
+
+
+
+/**
+ * @brief Checksum calculation function.
+ * @param data - POINTER to array of data bytes.
+ * @param lenght - POINTER to the lenght of the data array.
+ * @param PID_byte - the Protected ID (all 8 bits) byte. used in LIN 2.0
+ */
+uint8_t lin_isr::LIN_checksum(volatile uint8_t* data, volatile  uint8_t lenght, volatile  uint8_t PID_byte) {
+  uint16_t checksum = 0;
+
+  #ifdef LIN_VERSION_2_0        //  If it's LIN 2.0 the entire PID byte is included in the checksum calculation.
+    checksum = PID_byte;
+  #endif
+
+  for (uint8_t i = 0; i < lenght; i++)
+  {
+    checksum += data[i];
+    if(checksum > 0xFF){
+      checksum -= 0xFF;
+    }
+    //    checksum <= 0xFF ? : checksum-= 0xFF ;
+  }
+  uint8_t checksum_8 = ~checksum;                             //  Algorithm ask for the checksum to be inverted.
+  return checksum_8;
+}
+
+
+
+/**
+ * @brief Calculate the lenght of a lin message based on the ID.
+ * note, for LIN 1.3 will always return 8.
+ */
+uint8_t lin_isr::calculate_message_lenght(uint8_t ID){
+  #ifdef LIN_VERSION_1_3
+    return 8;
+  #else
+    ID = ID>>4;
+    switch (ID)
+    {
+    case 0x00:
+      return 2;
+    case 0x01:
+      return 2;
+    case 0x02:
+      return 4;
+    case 0x03:
+      return 8;
+    
+    default:
+      return 0;
+    }
+  #endif
 }
 
 
 
 
 
-      
-void LIN_slave::begin_LIN_Slave(unsigned long baud ) {
+
+
+
+
+
+
+
+
+/**
+ * @brief Setup of registers to begin LIN communication.
+ * @param baud - the baud rate of the LIN bus. Between 1'000 and 20'000
+ */      
+LIN_ERROR LIN_slave::begin_LIN_Slave(unsigned long baud ) {
+
+  //checking if the dataBuffer has been initialized:
+  if(ID_total < 1){
+    return ERROR_NOT_INITIALIZED;
+  }
+
+  //  checking the baud rate validity:
+  if(baud > MIN_BAUD && baud < MAX_BAUD){
+    return ERROR_BAUD_RATE;
+  }
       
   uint8_t   ctrla = 0, ctrlb = 0, ctrlc = 0;    //  Empty control register target
 
-  ctrla |= USART_RXCIE_bm;          //  Enable RX ISR
-  //ctrla |= USART_TXCIE_bm;        //  Enable TX ISR
-
-  #ifdef LOOPBACK
-  //ctrla |= USART_LBME_bm;           //  Enable LoopBack ? 
-  #endif
+  ctrla |= USART_RXCIE_bm;          //  Enable RX ISR, not Tx ISR,  do not set loopback.
   
-  ctrlb |= USART_RXEN_bm;          //  Enable RX  
-  ctrlb |= USART_TXEN_bm;          //  Enable TX
-  ctrlb |= USART_ODME_bm;          //  Set Open Drain Mode Enable - needed for loopback
+  ctrlb |= USART_RXEN_bm;          //  Enable RX module of USART - not the interrupt
+  ctrlb |= USART_TXEN_bm;          //  Enable TX module of USART - not the interrupt
   ctrlb |= USART_RXMODE_0_bm;      //  Setting the LINAUTO mode writing 0x03 to RXMODE field of CTRLB
   ctrlb |= USART_RXMODE_1_bm;
 
@@ -390,11 +421,11 @@ void LIN_slave::begin_LIN_Slave(unsigned long baud ) {
 
 void LIN_slave::_set_pins_lin(uint8_t mod_nbr, uint8_t mux_set, uint8_t enmask) {
   
-   //  CTRLB - Bit 0 – USART0Write this bit to '1' to select alternative communication pins for USART 0.
+  //  PORTMUX.CTRLB - Bit 0 – USART0 Write this bit to '1' to select alternative communication pins for USART 0.
   PORTMUX.CTRLB       &= 0xFE;   // &= 0b11111110 Will make sure to reset the first bit
 
     
-  const uint8_t* muxrow = &(_usart_pins[0][0]);     //  It was: _usart_pins[mod_nbr + mux_set][0]);
+  const uint8_t* muxrow = &(_usart_pins[0][0]);     // for 1614 standard pin. It was: _usart_pins[mod_nbr + mux_set][0]);
   
   
   if ((enmask & 0x40 && !(enmask & 0x08))) {      //  enmask & 0b01000000 && ! enmask & 0b00001000    --  never happens for LIN , right?!
@@ -406,7 +437,7 @@ void LIN_slave::_set_pins_lin(uint8_t mod_nbr, uint8_t mux_set, uint8_t enmask) 
   }
   
   //      1000'0000(rxen)   & not 0001'0000(LB)
-  if (enmask & 0x80 && !(enmask & 0x10)) {        //  if ctrlb  RXEN but NOT loopback
+  if (enmask & USART_RXEN_bm && !(enmask & 0x10)) {        //  if ctrlb  RXEN but NOT loopback
     // Likewise if RX is enabled, unless loopback mode is too (in which case we caught it above, it should be pulled up
     pinMode(muxrow[1], INPUT_PULLUP);
   }
@@ -414,52 +445,92 @@ void LIN_slave::_set_pins_lin(uint8_t mod_nbr, uint8_t mux_set, uint8_t enmask) 
 }
 
 
+/**
+ * @brief Constructor for the LIN_slave class.
+ */
+LIN_slave::LIN_slave(){}
 
-LIN_slave::LIN_slave(uint8_t number_of_ID_used, uint16_t baud)
-{  
-  if(number_of_ID_used > MAX_ID)
-    number_of_ID_used = MAX_ID;
-  else
-    ID_total = number_of_ID_used;
+
+
+
+
+LIN_ERROR LIN_slave::initialize_numberOfIDs(uint8_t number_of_ID_used){
+
+  //  checking if the Data_buffer has already bitialized: 
+  if(ID_total > 0){
+    return ERROR_ALREADY_INITIALIZED;
+  }
+
+  //  checking if number of IDs asked is within LIN specs range
+  if(number_of_ID_used > MAX_ID){
+    return ERROR_ID_OUT_OF_BOUND;
+  }
+  
+
+  ID_total = number_of_ID_used;
 
   ID_available = ID_total;
   ID_next_empty = 0;
 
-  Data_buffer = malloc(ID_total * sizeof(LIN_frame));
-  // Should I catch the possible exception here?
-
-  //  Setting the baud rate
-  if(baud > MIN_BAUS && baud < MAX_BAUS)
-    baud = baud;
-  else
-    baud = DEFAULT_BAUD;    //  Default baud rate
+  Data_buffer = (LIN_frame *) malloc(ID_total * sizeof(LIN_frame));
+  
+  if ( Data_buffer == NULL){
+    ID_total = 0;
+    ID_available = MAX_ID;
+    return ERROR;
+  }
+  else{
+    return LIN_OK;
+  }
+  
 }
 
+
+
+
 /**
- * @brief Will retrieve the LIN_frame to be tx inside the buffer.
+ * @brief public: Will retrieve the LIN_frame to be tx inside the buffer.
+ * @param ID - the ID (6 bit) of the frame to be retrieved.
  */
-LIN_frame LIN_slave::get_frame_fromBuffer(uint8_t ID)
+LIN_frame LIN_slave::get_frame_from_RxBuffer(uint8_t ID)
 {
   //  if ID is in RX_ID, then return the data
-  //  else return an empty frame
-  LIN_frame temp_frame;
+  //  else return an error frame
+  LIN_frame error_frame;
 
-  if(ID_map[ID].type == TX_type)
+  switch (ID_map[ID].type)
+  {
+  case RX_type:
     return Data_buffer[ID_map[ID].data_vec_address];
-  else
+  
+  case TX_type:
+    error_frame.error = ERROR_WRONG_ID_TYPE;
+    break;
 
-  return temp_frame;
+  case none:
+    error_frame.error = ERROR_ID_NOT_AVAILABLE;
+    break;
+  
+  default:
+    error_frame.error = ERROR;
+    break;
+  }
+
+  
+  return error_frame;
 }
 
 
 
 /**
- * @brief Write the 8 byte data_8 array to the buffer at address ID.
+ * @brief Write the 8 byte array to the buffer at given ID.
+ * @param ID - the ID to be written at.
+ * @param data_8 - pointer to array of data to be written to the buffer.
  */
-uint8_t LIN_slave::write_data_toBuffer(uint8_t ID, uint8_t *data_8)
+LIN_ERROR LIN_slave::write_data_to_TxBuffer(uint8_t ID, uint8_t *data_8)
 {
-  //  if ID is in TX_ID, then write the data, return 0 for correct operation.
-  if(ID_map[ID].type == RX_type){
+  //  if ID is in TX_ID, then write the data, 
+  if(ID_map[ID].type == TX_type){
 
     LIN_frame temp_frame;
     temp_frame.ID = ID;
@@ -469,67 +540,48 @@ uint8_t LIN_slave::write_data_toBuffer(uint8_t ID, uint8_t *data_8)
     } 
 
     Data_buffer[ID_map[ID].data_vec_address] = temp_frame;
-    return 0;
+    return LIN_OK;
   }
   else
-    return -1;
+    return ERROR_WRONG_ID_TYPE;
 }
 
 
-uint8_t LIN_slave::add_RX_ID(uint8_t ID)
+LIN_ERROR LIN_slave::add_RX_ID(uint8_t ID)
 {
-  add_to_list_ID(ID, RX_type);
+  return add_to_list_ID(ID, RX_type);
 }
-uint8_t LIN_slave::add_TX_ID(uint8_t ID)
+LIN_ERROR LIN_slave::add_TX_ID(uint8_t ID)
 {
-  add_to_list_ID(ID, TX_type);  
+  return add_to_list_ID(ID, TX_type);  
 }
 
-uint8_t LIN_slave::add_to_list_ID(uint8_t _ID,  ID_type _type){
+/**
+ * @brief Will add a ID to the list of IDs that this node will respond to.
+ * @param _ID - the ID to be added to the list.
+ * @param _type - the type of action associated with the ID.
+ */
+LIN_ERROR LIN_slave::add_to_list_ID(uint8_t _ID,  ID_type _type){
 
   if(_ID >= MAX_ID)
-    return -1;
+    return ERROR_ID_OUT_OF_BOUND;
 
   if(ID_available < 1)  
-      return -1;
+      return ERROR_ID_FULL;
 
+  //  check if id is still free:
   if(ID_map[_ID].type == none)
   {
     ID_map[_ID].type = _type;
     ID_map[_ID].data_vec_address = ID_next_empty;
     ID_next_empty++;
     ID_available--;
-    return 0;
+    return LIN_OK;
   }
   else
-    return -1;
+    return ERROR_ID_NOT_AVAILABLE;
 }
 
 
-/**
- * @brief Calculate the lenght of a lin message based on the ID.
- * note, for LIN 1.3 will always return 8.
- */
-uint8_t calc_message_lenght(uint8_t ID){
-  #ifdef LIN_VERSION_1_3
-    return 8;
-  #else
-    ID = ID>>4;
-    switch (ID)
-    {
-    case 0x00:
-      return 2;
-    case 0x01:
-      return 2;
-    case 0x02:
-      return 4;
-    case 0x03:
-      return 8;
-    
-    default:
-      return 0;
-    }
-  #endif
-}
 
-
+#endif
