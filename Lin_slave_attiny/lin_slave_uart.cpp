@@ -58,6 +58,7 @@ volatile LIN__state_machine_st LIN_SM;
 volatile LIN_TX_components LIN_TX;
 
 
+
 /**
  * @brief ISR for the USART0 RXC interrupt.
  * Will call the state machine to handle the received data.
